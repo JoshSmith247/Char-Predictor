@@ -1,0 +1,39 @@
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  splits_dir: data/splits
+  # Characters to support. Use hex-encoded dirs for filesystem-unsafe chars (/ -> char_2f)
+  charset: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%()-_=+[]{}|;:',.<>?/"
+
+scraping:
+  # Set via env var GOOGLE_FONTS_API_KEY or fill in here
+  google_fonts_api_key: ""
+  render_size: 64         # Render chars at this px size before downscaling to target_size
+  sleep_between_requests: 0.5
+  max_fonts: 1000         # Cap number of fonts to download (set lower for quick tests)
+
+preprocessing:
+  target_size: 32
+  glyph_margin_ratio: 0.1   # Fractional whitespace margin when padding to square
+
+model:
+  latent_dim: 128
+  encoder_filters: [32, 64, 128, 256]
+  decoder_filters: [256, 128, 64, 32]
+
+training:
+  K: 8                        # Number of font images per set during training
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  loss_alpha: 0.8             # Weight of MSE vs (1-alpha)*SSIM_loss
+  early_stopping_patience: 10
+  lr_reduce_patience: 5
+  lr_reduce_factor: 0.5
+  min_lr: 1.0e-6
+  checkpoint_dir: checkpoints
+  log_dir: logs
+
+inference:
+  model_path: models/final_model.keras
+  output_dir: output
