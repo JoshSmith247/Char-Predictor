@@ -15,16 +15,32 @@ import numpy as np
 import tensorflow as tf
 
 
-def _load_npy(path: str) -> np.ndarray:
-    return np.load(path).astype(np.float32)
-
-
 def _augment(img: np.ndarray) -> np.ndarray:
     """Apply mild per-image augmentation. img shape: (H, W, 1), float32 in [0,1]."""
     # Random brightness jitter ±0.1
     delta = np.random.uniform(-0.1, 0.1)
     img = np.clip(img + delta, 0.0, 1.0)
     return img
+
+
+def _preload_arrays(
+    char_font_map: dict[str, list[Path]],
+) -> tuple[dict[str, list[np.ndarray]], dict[str, np.ndarray]]:
+    """Load all .npy arrays into RAM once. Returns (font_arrays, mean_targets).
+
+    font_arrays:  {char: [array, ...]}  — one array per font path
+    mean_targets: {char: array}         — precomputed mean target per char
+    """
+    font_arrays: dict[str, list[np.ndarray]] = {}
+    mean_targets: dict[str, np.ndarray] = {}
+    for char, paths in char_font_map.items():
+        arrays = [np.load(str(p)).astype(np.float32) for p in paths]
+        mean_path = paths[0].parent / "mean_target.npy"
+        if not mean_path.exists():
+            continue
+        font_arrays[char] = arrays
+        mean_targets[char] = np.load(str(mean_path)).astype(np.float32)
+    return font_arrays, mean_targets
 
 
 def _make_generator(
@@ -34,30 +50,26 @@ def _make_generator(
     augment: bool,
     seed: int | None,
 ):
-    """Return a generator function yielding (inputs, target) pairs."""
-    chars = [c for c, paths in char_font_map.items() if len(paths) >= K]
+    """Return a generator function yielding (inputs, target) pairs.
+
+    All arrays are pre-loaded into RAM to avoid per-step disk I/O.
+    """
+    print("  Pre-loading dataset arrays into RAM...", flush=True)
+    font_arrays, mean_targets = _preload_arrays(char_font_map)
+    chars = [c for c in font_arrays if len(font_arrays[c]) >= K]
+    print(f"  Loaded {sum(len(v) for v in font_arrays.values())} arrays "
+          f"across {len(chars)} characters.", flush=True)
     rng = random.Random(seed)
 
     def generator():
         while True:
             char = rng.choice(chars)
-            font_paths = char_font_map[char]
-            sampled = rng.sample(font_paths, K)
+            arrays = font_arrays[char]
+            sampled = rng.sample(arrays, K)
 
-            # Load and optionally augment each image
-            imgs = []
-            for p in sampled:
-                arr = _load_npy(str(p))
-                if augment:
-                    arr = _augment(arr)
-                imgs.append(arr)
+            imgs = [_augment(arr) if augment else arr for arr in sampled]
             inputs = np.stack(imgs, axis=0)  # (K, H, W, 1)
-
-            # Load precomputed mean target
-            mean_path = p.parent / "mean_target.npy"
-            if not mean_path.exists():
-                continue
-            target = _load_npy(str(mean_path))  # (H, W, 1)
+            target = mean_targets[char]      # (H, W, 1)
 
             yield inputs, target
 
