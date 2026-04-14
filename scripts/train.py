@@ -4,7 +4,7 @@ scripts/train.py
 Renders characters from downloaded fonts, builds a dataset, and trains a CNN
 to predict which character is shown in an image.
 
-Usage:
+Usage (full 62-class mode):
     from scripts.train import CharPredictor
 
     predictor = CharPredictor()
@@ -12,6 +12,13 @@ Usage:
     predictor.build_dataset()
     predictor.build_model()
     predictor.train(epochs=20)
+
+Usage (lightweight single-character mode):
+    predictor = CharPredictor(target_char="A")
+    predictor.build_dataset()   # binary labels: 1 = "A", 0 = everything else
+    predictor.build_model()     # small CNN with sigmoid output
+    predictor.train(epochs=10)
+    predictor.predict(image)    # returns True/False
 """
 
 import os
@@ -43,9 +50,28 @@ FONT_PT    = 48   # point size used when rendering
 # ---------------------------------------------------------------------------
 
 class CharPredictor:
-    def __init__(self, fonts_dir: str = "fonts", model_dir: str = "model"):
+    def __init__(
+        self,
+        fonts_dir: str = "fonts",
+        model_dir: str = "model",
+        target_char: str | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        target_char : str or None
+            When set, the model becomes a lightweight binary classifier:
+            "is this image the character *target_char*?"
+            When None (default), the model classifies all 62 characters.
+        """
+        if target_char is not None and target_char not in CHAR_TO_IDX:
+            raise ValueError(
+                f"target_char {target_char!r} is not in CHARACTERS. "
+                f"Valid characters: {CHARACTERS}"
+            )
         self.fonts_dir = fonts_dir
         self.model_dir = model_dir
+        self.target_char = target_char
         self.model = None
         self._X: np.ndarray | None = None
         self._y: np.ndarray | None = None
@@ -97,12 +123,16 @@ class CharPredictor:
 
     def build_dataset(self) -> tuple[np.ndarray, np.ndarray]:
         """
-        Render every character in CHARACTERS with every downloaded font.
+        Render characters with every downloaded font.
+
+        In full mode : renders all 62 characters; y holds class indices.
+        In single-char mode : renders all characters; y is binary
+            (1 = target_char, 0 = everything else).
 
         Returns
         -------
         X : float32 array of shape (N, IMAGE_SIZE, IMAGE_SIZE, 1), values in [0, 1]
-        y : int32  array of shape (N,), class indices into CHARACTERS
+        y : int32 array of shape (N,)
         """
         font_files = self._collect_font_files()
         if not font_files:
@@ -111,7 +141,8 @@ class CharPredictor:
                 "Run download_fonts() first."
             )
 
-        print(f"Building dataset from {len(font_files)} font files...")
+        print(f"Building dataset from {len(font_files)} font files "
+              f"({'binary: ' + repr(self.target_char) if self.target_char else '62-class'})...")
 
         images, labels = [], []
         for font_idx, font_path in enumerate(font_files, start=1):
@@ -120,18 +151,22 @@ class CharPredictor:
                 if arr is None:
                     continue
                 images.append(arr)
-                labels.append(CHAR_TO_IDX[char])
+                if self.target_char is not None:
+                    labels.append(1 if char == self.target_char else 0)
+                else:
+                    labels.append(CHAR_TO_IDX[char])
 
             if font_idx % 10 == 0 or font_idx == len(font_files):
                 print(f"  Processed {font_idx}/{len(font_files)} fonts "
                       f"({len(images)} samples so far)")
 
         X = np.stack(images, axis=0).astype(np.float32) / 255.0
-        X = X[..., np.newaxis]                          # add channel dim
+        X = X[..., np.newaxis]
         y = np.array(labels, dtype=np.int32)
 
+        n_classes = 2 if self.target_char else NUM_CLASSES
         self._X, self._y = X, y
-        print(f"Dataset ready: {X.shape[0]} samples, {NUM_CLASSES} classes.")
+        print(f"Dataset ready: {X.shape[0]} samples, {n_classes} classes.")
         return X, y
 
     # ------------------------------------------------------------------
@@ -140,35 +175,55 @@ class CharPredictor:
 
     def build_model(self) -> "tf.keras.Model":
         """
-        Build and compile a small CNN suited for character recognition.
+        Build and compile a CNN for character recognition.
 
-        Architecture
-        ------------
-        3 × (Conv2D → BatchNorm → MaxPool) blocks, then Dense head.
+        Full mode (target_char=None)
+        ----------------------------
+        3 × (Conv2D → BatchNorm → MaxPool) blocks → Dense(256) → softmax(62)
+
+        Single-char mode (target_char set)  ← lightweight
+        ----------------------------
+        2 × (Conv2D → MaxPool) blocks → Dense(64) → sigmoid(1)
+        ~10× fewer parameters; binary cross-entropy loss.
         """
         import tensorflow as tf
 
         inputs = tf.keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 1))
-
         x = inputs
-        for filters in (32, 64, 128):
-            x = tf.keras.layers.Conv2D(filters, 3, padding="same", activation="relu")(x)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.MaxPooling2D(2)(x)
 
-        x = tf.keras.layers.Flatten()(x)
-        x = tf.keras.layers.Dense(256, activation="relu")(x)
-        x = tf.keras.layers.Dropout(0.4)(x)
-        outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")(x)
+        if self.target_char is not None:
+            # Lightweight binary classifier
+            for filters in (16, 32):
+                x = tf.keras.layers.Conv2D(filters, 3, padding="same", activation="relu")(x)
+                x = tf.keras.layers.MaxPooling2D(2)(x)
+            x = tf.keras.layers.Flatten()(x)
+            x = tf.keras.layers.Dense(64, activation="relu")(x)
+            x = tf.keras.layers.Dropout(0.3)(x)
+            outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+            model = tf.keras.Model(inputs, outputs, name=f"char_predictor_{self.target_char}")
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(1e-3),
+                loss="binary_crossentropy",
+                metrics=["accuracy"],
+            )
+        else:
+            # Full 62-class classifier
+            for filters in (32, 64, 128):
+                x = tf.keras.layers.Conv2D(filters, 3, padding="same", activation="relu")(x)
+                x = tf.keras.layers.BatchNormalization()(x)
+                x = tf.keras.layers.MaxPooling2D(2)(x)
+            x = tf.keras.layers.Flatten()(x)
+            x = tf.keras.layers.Dense(256, activation="relu")(x)
+            x = tf.keras.layers.Dropout(0.4)(x)
+            outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")(x)
+            model = tf.keras.Model(inputs, outputs, name="char_predictor")
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(1e-3),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
 
-        model = tf.keras.Model(inputs, outputs, name="char_predictor")
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(1e-3),
-            loss="sparse_categorical_crossentropy",
-            metrics=["accuracy"],
-        )
         model.summary()
-
         self.model = model
         return model
 
@@ -196,7 +251,8 @@ class CharPredictor:
             raise RuntimeError("Call build_dataset() before train().")
 
         os.makedirs(self.model_dir, exist_ok=True)
-        checkpoint_path = os.path.join(self.model_dir, "best.keras")
+        stem = f"char_{self.target_char}" if self.target_char else "char_predictor"
+        checkpoint_path = os.path.join(self.model_dir, f"{stem}_best.keras")
 
         callbacks = [
             tf.keras.callbacks.ModelCheckpoint(
@@ -229,7 +285,7 @@ class CharPredictor:
             shuffle=True,
         )
 
-        final_path = os.path.join(self.model_dir, "char_predictor.keras")
+        final_path = os.path.join(self.model_dir, f"{stem}.keras")
         self.model.save(final_path)
         print(f"Model saved to '{final_path}'.")
 
@@ -243,12 +299,13 @@ class CharPredictor:
         """Load the saved model from self.model_dir."""
         import tensorflow as tf
 
-        path = os.path.join(self.model_dir, "char_predictor.keras")
+        stem = f"char_{self.target_char}" if self.target_char else "char_predictor"
+        path = os.path.join(self.model_dir, f"{stem}.keras")
         if not os.path.exists(path):
             raise FileNotFoundError(f"No saved model found at '{path}'.")
         self.model = tf.keras.models.load_model(path)
 
-    def predict(self, image: "np.ndarray | str") -> str:
+    def predict(self, image: "np.ndarray | str") -> "str | bool":
         """
         Predict the character shown in an image.
 
@@ -260,7 +317,8 @@ class CharPredictor:
 
         Returns
         -------
-        str : the predicted character
+        str  : predicted character (full 62-class mode)
+        bool : True if the image shows target_char (single-char mode)
         """
         if self.model is None:
             raise RuntimeError("Call build_model()+train() or load_model() first.")
@@ -276,8 +334,12 @@ class CharPredictor:
         x = arr.astype(np.float32) / 255.0
         x = x[np.newaxis, ..., np.newaxis]              # (1, H, W, 1)
 
-        probs = self.model.predict(x, verbose=0)[0]
-        return IDX_TO_CHAR[int(np.argmax(probs))]
+        if self.target_char is not None:
+            prob = float(self.model.predict(x, verbose=0)[0][0])
+            return prob >= 0.5
+        else:
+            probs = self.model.predict(x, verbose=0)[0]
+            return IDX_TO_CHAR[int(np.argmax(probs))]
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +355,19 @@ if __name__ == "__main__":
     parser.add_argument("--model-dir", default="model")
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--target-char",
+        default=None,
+        help="Train a lightweight binary classifier for a single character "
+             "(e.g. --target-char A). Omit for full 62-class mode.",
+    )
     args = parser.parse_args()
 
-    predictor = CharPredictor(fonts_dir=args.fonts_dir, model_dir=args.model_dir)
+    predictor = CharPredictor(
+        fonts_dir=args.fonts_dir,
+        model_dir=args.model_dir,
+        target_char=args.target_char,
+    )
     predictor.download_fonts(api_key=args.api_key, count=args.count)
     predictor.build_dataset()
     predictor.build_model()
