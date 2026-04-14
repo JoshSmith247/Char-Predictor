@@ -46,10 +46,12 @@ class Sampling(tf.keras.layers.Layer):
 class _VAEModel(tf.keras.Model):
     """Wraps encoder + decoder; implements the combined VAE loss in train_step."""
 
-    def __init__(self, encoder, decoder, **kwargs):
+    def __init__(self, encoder, decoder, foreground_weight: float = 5.0, kl_weight: float = 0.5, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
+        self.foreground_weight = foreground_weight
+        self.kl_weight = kl_weight
         self._loss_tracker  = tf.keras.metrics.Mean(name="loss")
         self._recon_tracker = tf.keras.metrics.Mean(name="recon_loss")
         self._kl_tracker    = tf.keras.metrics.Mean(name="kl_loss")
@@ -63,13 +65,11 @@ class _VAEModel(tf.keras.Model):
             z_mean, z_log_var, z = self.encoder(data, training=True)
             reconstruction = self.decoder(z, training=True)
 
-            # Reconstruction: binary cross-entropy summed over pixels
-            recon = tf.reduce_mean(
-                tf.reduce_sum(
-                    tf.keras.losses.binary_crossentropy(data, reconstruction),
-                    axis=(1, 2),
-                )
-            )
+            # Weighted reconstruction loss: upweight foreground (bright) pixels so
+            # the model isn't dominated by the large black background.
+            pixel_bce = tf.keras.losses.binary_crossentropy(data, reconstruction)
+            weight_map = 1.0 + tf.squeeze(data, -1) * (self.foreground_weight - 1.0)
+            recon = tf.reduce_mean(tf.reduce_sum(weight_map * pixel_bce, axis=(1, 2)))
             # KL divergence from N(0,1)
             kl = -0.5 * tf.reduce_mean(
                 tf.reduce_sum(
@@ -77,7 +77,7 @@ class _VAEModel(tf.keras.Model):
                     axis=1,
                 )
             )
-            loss = recon + kl
+            loss = recon + self.kl_weight * kl
 
         grads = tape.gradient(loss, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
@@ -97,7 +97,7 @@ class CharVAE:
         target_char: str,
         fonts_dir: str = "fonts",
         model_dir: str = "model",
-        latent_dim: int = 32,
+        latent_dim: int = 16,
     ):
         self.target_char = target_char
         self.fonts_dir   = fonts_dir
@@ -164,10 +164,10 @@ class CharVAE:
     # 3. Model
     # ------------------------------------------------------------------
 
-    def build_model(self) -> None:
+    def build_model(self, lr: float = 3e-4, foreground_weight: float = 5.0, kl_weight: float = 0.5) -> None:
         """
         Encoder  : 64×64×1  →  Conv×2  →  Dense(128)  →  [z_mean, z_log_var, z]
-        Decoder  : latent    →  Dense   →  ConvTranspose×2  →  64×64×1
+        Decoder  : latent    →  Dense   →  Upsample×2 + Conv+BN  →  refinement conv  →  64×64×1
         """
         latent_dim = self.latent_dim
 
@@ -183,16 +183,25 @@ class CharVAE:
         self.encoder = tf.keras.Model(enc_in, [z_mean, z_log_var, z], name="encoder")
 
         # --- Decoder ---
+        BN      = tf.keras.layers.BatchNormalization
+        Drop    = lambda: tf.keras.layers.Dropout(0.1)
         dec_in  = tf.keras.Input(shape=(latent_dim,))
-        x       = tf.keras.layers.Dense(16 * 16 * 64, activation="relu")(dec_in)
-        x       = tf.keras.layers.Reshape((16, 16, 64))(x)
-        x       = tf.keras.layers.Conv2DTranspose(64, 3, strides=2, padding="same", activation="relu")(x)
-        x       = tf.keras.layers.Conv2DTranspose(32, 3, strides=2, padding="same", activation="relu")(x)
-        dec_out = tf.keras.layers.Conv2DTranspose(1,  3, padding="same", activation="sigmoid")(x)
+        x       = tf.keras.layers.Dense(16 * 16 * 128, activation="relu")(dec_in)
+        x       = tf.keras.layers.Reshape((16, 16, 128))(x)
+        x       = tf.keras.layers.UpSampling2D(2)(x)               # 16×16 → 32×32
+        x       = tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu")(x)
+        x       = BN()(x)
+        x       = Drop()(x)
+        x       = tf.keras.layers.UpSampling2D(2)(x)               # 32×32 → 64×64
+        x       = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+        x       = BN()(x)
+        x       = Drop()(x)
+        x       = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)  # refinement
+        dec_out = tf.keras.layers.Conv2D(1,  3, padding="same", activation="sigmoid")(x)
         self.decoder = tf.keras.Model(dec_in, dec_out, name="decoder")
 
-        self._vae = _VAEModel(self.encoder, self.decoder, name="char_vae")
-        self._vae.compile(optimizer=tf.keras.optimizers.Adam(1e-3))
+        self._vae = _VAEModel(self.encoder, self.decoder, foreground_weight=foreground_weight, kl_weight=kl_weight, name="char_vae")
+        self._vae.compile(optimizer=tf.keras.optimizers.Adam(lr))
 
         self.encoder.summary()
         self.decoder.summary()
@@ -237,13 +246,18 @@ class CharVAE:
     def generate(self, n: int = 1) -> np.ndarray:
         """
         Sample n images by drawing from the latent prior N(0, I).
+        Each image is contrast-stretched to fill the full 0–255 range.
         Returns uint8 array of shape (n, IMAGE_SIZE, IMAGE_SIZE).
         """
         if self.decoder is None:
             raise RuntimeError("Call build_model()+train() or load() first.")
         z    = np.random.normal(size=(n, self.latent_dim)).astype(np.float32)
-        imgs = self.decoder.predict(z, verbose=0)   # (n, 64, 64, 1)
-        return (imgs[..., 0] * 255).astype(np.uint8)
+        imgs = self.decoder.predict(z, verbose=0)[..., 0]   # (n, 64, 64)
+        # Per-image contrast stretch so dim outputs aren't invisible
+        lo = imgs.min(axis=(1, 2), keepdims=True)
+        hi = imgs.max(axis=(1, 2), keepdims=True)
+        imgs = np.where(hi > lo, (imgs - lo) / (hi - lo), imgs)
+        return (imgs * 255).astype(np.uint8)
 
     def save_grid(self, images: np.ndarray, path: str, cols: int = 4) -> None:
         """
@@ -272,8 +286,11 @@ if __name__ == "__main__":
     parser.add_argument("--fonts-dir",  default="fonts")
     parser.add_argument("--model-dir",  default="model")
     parser.add_argument("--count",      type=int, default=100)
-    parser.add_argument("--latent-dim", type=int, default=32)
+    parser.add_argument("--latent-dim", type=int, default=16)
     parser.add_argument("--epochs",     type=int, default=50)
+    parser.add_argument("--lr",                type=float, default=3e-4, help="Adam learning rate (default: 3e-4)")
+    parser.add_argument("--foreground-weight", type=float, default=5.0,  help="Loss weight for bright (foreground) pixels (default: 5.0)")
+    parser.add_argument("--kl-weight",         type=float, default=0.5,  help="Weight on the KL term — lower = sharper outputs, less regular latent space (default: 0.5)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--load",       action="store_true", help="Skip training; load saved model instead")
     parser.add_argument("--generate",   type=int, default=16, metavar="N", help="Number of images to generate")
@@ -293,7 +310,7 @@ if __name__ == "__main__":
         if args.api_key:
             vae.download_fonts(api_key=args.api_key, count=args.count)
         vae.build_dataset()
-        vae.build_model()
+        vae.build_model(lr=args.lr, foreground_weight=args.foreground_weight, kl_weight=args.kl_weight)
         vae.train(epochs=args.epochs, batch_size=args.batch_size)
 
     imgs = vae.generate(n=args.generate)
