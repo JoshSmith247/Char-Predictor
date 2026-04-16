@@ -2,7 +2,7 @@
 
 Two models for working with character images rendered from Google Fonts:
 
-- **VAE** (`scripts/vae.py`) — generates new images of a single character
+- **Dual-Encoder** (`scripts/model.py`) — predicts what a character looks like in a new font by learning content and style separately
 - **Classifier** (`scripts/train.py`) — predicts which character is shown in an image
 
 ---
@@ -15,24 +15,39 @@ pip install tensorflow pillow requests
 
 ---
 
-## VAE — Generate character images
+## Dual-Encoder — Predict a character in a new font style
+
+Given a target character and a font file, the model predicts what that character would look like rendered in that font. It uses a content encoder (the character across many fonts) and a style encoder (other characters in the same font) to synthesise the output.
 
 ### Train
 
+Download fonts and train from scratch:
+
 ```bash
-python scripts/vae.py --target-char A --epochs 40 --lr 3e-4 --latent-dim 16 --foreground-weight 2.0 --kl-weight 0.7 --generate 16 --output generated.png
+python scripts/model.py --target-char A --api-key YOUR_KEY --count 100
 ```
 
-If you haven't downloaded fonts yet, add your Google Fonts API key:
+Additional training options (all optional):
 
 ```bash
-python scripts/vae.py --target-char A --api-key YOUR_KEY --count 100 --epochs 40 --lr 3e-4 --latent-dim 16 --foreground-weight 2.0 --kl-weight 0.7 --generate 16 --output generated.png
+python scripts/model.py --target-char A --api-key YOUR_KEY --count 100 \
+  --epochs 50 --batch-size 32 --lr 3e-4 \
+  --latent-dim 16 --n-content 8 --k-style 4 \
+  --foreground-weight 5.0
 ```
 
-### Generate from a saved model
+If fonts are already downloaded, omit `--api-key`:
 
 ```bash
-python scripts/vae.py --target-char A --load --generate 16 --output generated.png
+python scripts/model.py --target-char A --epochs 50
+```
+
+### Predict
+
+Load saved weights and run inference on a font file:
+
+```bash
+python scripts/model.py --target-char A --load --font-path fonts/FontFamily/FontName.ttf --output predicted.png
 ```
 
 ---
