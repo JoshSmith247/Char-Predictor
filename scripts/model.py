@@ -1,49 +1,24 @@
 """
 scripts/model.py
 
-Dual-encoder character style predictor.
-
-Architecture:
-    N images of char C (across many fonts)  →  Content Encoder  →  z_content
-    K images of font F (various chars)      →  Style Encoder    →  z_style
-                                                                        ↓
-                                                              Concat + Dense(latent_dim)
-                                                                        ↓
-                                                                    Decoder  →  C in font F
-
-Usage (Python):
-    from scripts.model import CharStylePredictor
-
-    p = CharStylePredictor(target_char="A")
-    p.download_fonts(api_key="YOUR_KEY")
-    p.build_dataset()
-    p.build_model()
-    p.train(epochs=50)
-    img = p.predict(font_path="fonts/MyFont/MyFont-Regular.ttf")  # (64, 64) uint8
-    p.save_grid([img], "predicted.png")
-
-Usage (CLI):
-    python scripts/model.py --target-char A --epochs 50
-    python scripts/model.py --target-char A --load --font-path fonts/MyFont.ttf --output out.png
+@authors
 """
 
 import os
 import sys
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import tensorflow as tf
+from PIL import Image, ImageDraw, ImageFont # For image processing
+import tensorflow as tf # For NN
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from font_downloader import FontDownloader
 
 IMAGE_SIZE = 64
-FONT_PT    = 48
-UPPERCASE  = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+FONT_PT = 48
+UPPERCASE = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
-# ---------------------------------------------------------------------------
 # Keras building blocks
-# ---------------------------------------------------------------------------
 
 class _SetEncoder(tf.keras.layers.Layer):
     """
@@ -58,11 +33,11 @@ class _SetEncoder(tf.keras.layers.Layer):
         self.image_encoder = image_encoder
 
     def call(self, x, training=False):
-        batch  = tf.shape(x)[0]
-        k      = tf.shape(x)[1]
+        batch = tf.shape(x)[0]
+        k = tf.shape(x)[1]
         x_flat = tf.reshape(x, (batch * k, IMAGE_SIZE, IMAGE_SIZE, 1))
         z_flat = self.image_encoder(x_flat, training=training)   # (batch*K, latent_dim)
-        z      = tf.reshape(z_flat, (batch, k, -1))
+        z = tf.reshape(z_flat, (batch, k, -1))
         return tf.reduce_mean(z, axis=1)                          # (batch, latent_dim)
 
 
@@ -73,20 +48,20 @@ class _DualEncoderModel(tf.keras.Model):
     """
     def __init__(
         self,
-        content_set_enc:  _SetEncoder,
-        style_set_enc:    _SetEncoder,
-        fusion:           tf.keras.layers.Layer,
-        decoder:          tf.keras.Model,
+        content_set_enc: _SetEncoder,
+        style_set_enc: _SetEncoder,
+        fusion: tf.keras.layers.Layer,
+        decoder: tf.keras.Model,
         foreground_weight: float = 5.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.content_set_enc   = content_set_enc
-        self.style_set_enc     = style_set_enc
-        self.fusion            = fusion
-        self.decoder           = decoder
+        self.content_set_enc = content_set_enc
+        self.style_set_enc = style_set_enc
+        self.fusion = fusion
+        self.decoder = decoder
         self.foreground_weight = foreground_weight
-        self._loss_tracker     = tf.keras.metrics.Mean(name="loss")
+        self._loss_tracker = tf.keras.metrics.Mean(name="loss")
 
     @property
     def metrics(self):
@@ -95,17 +70,17 @@ class _DualEncoderModel(tf.keras.Model):
     def call(self, inputs, training=False):
         content_imgs, style_imgs = inputs
         z_content = self.content_set_enc(content_imgs, training=training)
-        z_style   = self.style_set_enc(style_imgs,     training=training)
-        z_fused   = self.fusion(tf.concat([z_content, z_style], axis=-1), training=training)
+        z_style = self.style_set_enc(style_imgs,     training=training)
+        z_fused = self.fusion(tf.concat([z_content, z_style], axis=-1), training=training)
         return self.decoder(z_fused, training=training)
 
     def train_step(self, data):
         (content_imgs, style_imgs), target = data
         with tf.GradientTape() as tape:
-            pred      = self((content_imgs, style_imgs), training=True)
+            pred = self((content_imgs, style_imgs), training=True)
             pixel_bce = tf.keras.losses.binary_crossentropy(target, pred)
-            weights   = 1.0 + tf.squeeze(target, -1) * (self.foreground_weight - 1.0)
-            loss      = tf.reduce_mean(tf.reduce_sum(weights * pixel_bce, axis=(1, 2)))
+            weights = 1.0 + tf.squeeze(target, -1) * (self.foreground_weight - 1.0)
+            loss = tf.reduce_mean(tf.reduce_sum(weights * pixel_bce, axis=(1, 2)))
 
         grads = tape.gradient(loss, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
@@ -113,20 +88,18 @@ class _DualEncoderModel(tf.keras.Model):
         return {"loss": self._loss_tracker.result()}
 
 
-# ---------------------------------------------------------------------------
 # CharStylePredictor
-# ---------------------------------------------------------------------------
 
 class CharStylePredictor:
     def __init__(
         self,
-        target_char:  str,
-        style_chars:  list[str] | None = None,
-        fonts_dir:    str = "fonts",
-        model_dir:    str = "model",
-        latent_dim:   int = 16,
-        n_content:    int = 8,
-        k_style:      int = 4,
+        target_char: str,
+        style_chars: list[str] | None = None,
+        fonts_dir: str = "fonts",
+        model_dir: str = "model",
+        latent_dim: int = 16,
+        n_content: int = 8,
+        k_style: int = 4,
     ):
         """
         Parameters
@@ -142,6 +115,8 @@ class CharStylePredictor:
         n_content    : Number of content reference images per training example.
         k_style      : Number of style reference images per training example.
         """
+
+        # Input checking
         if len(target_char) != 1:
             raise ValueError("target_char must be a single character.")
         if style_chars is not None and len(style_chars) < k_style:
@@ -153,28 +128,24 @@ class CharStylePredictor:
         self.style_chars = style_chars if style_chars is not None else [
             c for c in UPPERCASE if c != target_char
         ]
-        self.fonts_dir  = fonts_dir
-        self.model_dir  = model_dir
+        self.fonts_dir = fonts_dir
+        self.model_dir = model_dir
         self.latent_dim = latent_dim
-        self.n_content  = n_content
-        self.k_style    = k_style
+        self.n_content = n_content
+        self.k_style = k_style
 
-        self._model:      _DualEncoderModel | None = None
-        self._dataset:    tf.data.Dataset | None   = None
-        self._renders:    dict[str, dict[str, np.ndarray]] = {}
+        self._model: _DualEncoderModel | None = None
+        self._dataset: tf.data.Dataset | None = None
+        self._renders: dict[str, dict[str, np.ndarray]] = {}
         self._font_paths: list[str] = []
 
-    # ------------------------------------------------------------------
-    # 1. Font acquisition
-    # ------------------------------------------------------------------
+    # Font acquisition
 
     def download_fonts(self, api_key: str, count: int = 100) -> None:
         """Download Google Fonts into self.fonts_dir."""
         FontDownloader(api_key=api_key).download(output_dir=self.fonts_dir, count=count)
 
-    # ------------------------------------------------------------------
-    # 2. Dataset
-    # ------------------------------------------------------------------
+    # Dataset
 
     def _collect_font_files(self) -> list[str]:
         paths = []
@@ -190,7 +161,7 @@ class CharStylePredictor:
             pil_font = ImageFont.truetype(font_path, size=FONT_PT)
         except Exception:
             return None
-        img  = Image.new("L", (IMAGE_SIZE, IMAGE_SIZE), color=0)
+        img = Image.new("L", (IMAGE_SIZE, IMAGE_SIZE), color=0)
         draw = ImageDraw.Draw(img)
         bbox = draw.textbbox((0, 0), char, font=pil_font)
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -204,15 +175,11 @@ class CharStylePredictor:
         Pre-renders target_char + every style_char in every usable font, then
         assembles a tf.data.Dataset of ((content_imgs, style_imgs), target) triplets.
 
-        content_imgs : (n_content, 64, 64, 1)  — target_char rendered in other fonts
-        style_imgs   : (k_style,   64, 64, 1)  — style_chars rendered in the target font
-        target       : (64, 64, 1)              — target_char rendered in the target font
-
         Style chars are randomly sampled from self.style_chars per training example,
         which makes the model robust to different reference sets at inference time.
         """
         chars_needed = set(self.style_chars) | {self.target_char}
-        font_paths   = self._collect_font_files()
+        font_paths = self._collect_font_files()
         if not font_paths:
             raise RuntimeError(f"No font files found in '{self.fonts_dir}'. Run download_fonts() first.")
 
@@ -223,8 +190,8 @@ class CharStylePredictor:
             for ch in chars_needed:
                 arr = self._render_char(ch, fp)
                 if arr is not None:
-                    rendered[ch] = arr[..., np.newaxis]   # (64, 64, 1)
-            if len(rendered) == len(chars_needed):        # skip fonts missing any needed glyph
+                    rendered[ch] = arr[..., np.newaxis]
+            if len(rendered) == len(chars_needed):
                 renders[fp] = rendered
             if i % 20 == 0 or i == len(font_paths):
                 print(f"  {i}/{len(font_paths)} fonts scanned, {len(renders)} usable")
@@ -235,7 +202,7 @@ class CharStylePredictor:
                 f"Only {len(usable)} usable fonts; need at least {self.n_content + 1}."
             )
 
-        self._renders    = renders
+        self._renders = renders
         self._font_paths = usable
 
         # Build arrays — one triplet per font, with randomly sampled style/content refs
@@ -246,7 +213,7 @@ class CharStylePredictor:
             other_fonts = [f for f in usable if f != fp]
             if len(other_fonts) < self.n_content:
                 continue
-            content_fonts  = rng.choice(other_fonts, size=self.n_content, replace=False)
+            content_fonts = rng.choice(other_fonts, size=self.n_content, replace=False)
             sampled_styles = rng.choice(self.style_chars, size=self.k_style, replace=False)
 
             content_list.append(np.stack([renders[f][self.target_char] for f in content_fonts]))
@@ -262,9 +229,7 @@ class CharStylePredictor:
         print(f"Dataset: {len(target_list)} triplets from {len(usable)} fonts.")
         return ds
 
-    # ------------------------------------------------------------------
-    # 3. Model
-    # ------------------------------------------------------------------
+    # Model
 
     def _build_components(self) -> None:
         """
@@ -276,31 +241,31 @@ class CharStylePredictor:
         def _img_encoder(name: str) -> tf.keras.Model:
             """Single-image CNN: (64, 64, 1) → (latent_dim,)"""
             inp = tf.keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 1))
-            x   = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu")(inp)
-            x   = tf.keras.layers.Conv2D(64, 3, strides=2, padding="same", activation="relu")(x)
-            x   = tf.keras.layers.Flatten()(x)
-            x   = tf.keras.layers.Dense(128, activation="relu")(x)
-            z   = tf.keras.layers.Dense(latent_dim)(x)
+            x = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu")(inp)
+            x = tf.keras.layers.Conv2D(64, 3, strides=2, padding="same", activation="relu")(x)
+            x = tf.keras.layers.Flatten()(x)
+            x = tf.keras.layers.Dense(128, activation="relu")(x)
+            z = tf.keras.layers.Dense(latent_dim)(x)
             return tf.keras.Model(inp, z, name=name)
 
         # Separate weights for content vs style encoders
         content_img_enc = _img_encoder("content_img_enc")
-        style_img_enc   = _img_encoder("style_img_enc")
+        style_img_enc = _img_encoder("style_img_enc")
 
         # Decoder: latent_dim → 64×64×1
-        BN      = tf.keras.layers.BatchNormalization
-        dec_in  = tf.keras.Input(shape=(latent_dim,))
-        x       = tf.keras.layers.Dense(16 * 16 * 128, activation="relu")(dec_in)
-        x       = tf.keras.layers.Reshape((16, 16, 128))(x)
-        x       = tf.keras.layers.UpSampling2D(2)(x)                               # → 32×32
-        x       = tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu")(x)
-        x       = BN()(x)
-        x       = tf.keras.layers.Dropout(0.1)(x)
-        x       = tf.keras.layers.UpSampling2D(2)(x)                               # → 64×64
-        x       = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
-        x       = BN()(x)
-        x       = tf.keras.layers.Dropout(0.1)(x)
-        x       = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+        BN = tf.keras.layers.BatchNormalization
+        dec_in = tf.keras.Input(shape=(latent_dim,))
+        x = tf.keras.layers.Dense(16 * 16 * 128, activation="relu")(dec_in)
+        x = tf.keras.layers.Reshape((16, 16, 128))(x)
+        x = tf.keras.layers.UpSampling2D(2)(x)                               # → 32×32
+        x = tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu")(x)
+        x = BN()(x)
+        x = tf.keras.layers.Dropout(0.1)(x)
+        x = tf.keras.layers.UpSampling2D(2)(x)                               # → 64×64
+        x = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+        x = BN()(x)
+        x = tf.keras.layers.Dropout(0.1)(x)
+        x = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
         dec_out = tf.keras.layers.Conv2D(1, 3, padding="same", activation="sigmoid")(x)
         decoder = tf.keras.Model(dec_in, dec_out, name="decoder")
 
@@ -340,9 +305,7 @@ class CharStylePredictor:
         self._model.compile(optimizer=tf.keras.optimizers.Adam(lr))
         self._model.summary()
 
-    # ------------------------------------------------------------------
-    # 4. Training
-    # ------------------------------------------------------------------
+    # Training
 
     def train(self, epochs: int = 50, batch_size: int = 32) -> None:
         if self._model is None:
@@ -369,9 +332,7 @@ class CharStylePredictor:
         self._build_components()
         self._model.load_weights(path)
 
-    # ------------------------------------------------------------------
-    # 5. Inference
-    # ------------------------------------------------------------------
+    # Inference
 
     def predict(self, font_path: str, style_chars: list[str] | None = None) -> np.ndarray:
         """
@@ -404,7 +365,7 @@ class CharStylePredictor:
         # (1, k_style, 64, 64, 1)
 
         # Content images: sample n_content fonts from the training set
-        rng     = np.random.default_rng()
+        rng = np.random.default_rng()
         sampled = rng.choice(self._font_paths, size=self.n_content, replace=False)
         content_arr = np.stack(
             [self._renders[f][self.target_char] for f in sampled]
@@ -412,7 +373,7 @@ class CharStylePredictor:
         # (1, n_content, 64, 64, 1)
 
         pred = self._model((content_arr, style_arr), training=False).numpy()
-        img  = pred[0, ..., 0]   # (64, 64)
+        img = pred[0, ..., 0]   # (64, 64)
         lo, hi = img.min(), img.max()
         if hi > lo:
             img = (img - lo) / (hi - lo)
@@ -420,7 +381,7 @@ class CharStylePredictor:
 
     def save_grid(self, images: list[np.ndarray], path: str, cols: int = 4) -> None:
         """Arrange (64, 64) uint8 images in a grid and write to a PNG file."""
-        arr  = np.stack(images)
+        arr = np.stack(images)
         n, h, w = arr.shape
         rows = (n + cols - 1) // cols
         grid = Image.new("L", (cols * w, rows * h), color=0)
@@ -430,9 +391,7 @@ class CharStylePredictor:
         print(f"Saved {n}-image grid to '{path}'.")
 
 
-# ---------------------------------------------------------------------------
 # CLI entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse

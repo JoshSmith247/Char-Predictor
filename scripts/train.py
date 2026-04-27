@@ -4,21 +4,6 @@ scripts/train.py
 Renders characters from downloaded fonts, builds a dataset, and trains a CNN
 to predict which character is shown in an image.
 
-Usage (full 62-class mode):
-    from scripts.train import CharPredictor
-
-    predictor = CharPredictor()
-    predictor.download_fonts(api_key="YOUR_KEY", count=100)
-    predictor.build_dataset()
-    predictor.build_model()
-    predictor.train(epochs=20)
-
-Usage (lightweight single-character mode):
-    predictor = CharPredictor(target_char="A")
-    predictor.build_dataset()   # binary labels: 1 = "A", 0 = everything else
-    predictor.build_model()     # small CNN with sigmoid output
-    predictor.train(epochs=10)
-    predictor.predict(image)    # returns True/False
 """
 
 import os
@@ -29,9 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from font_downloader import FontDownloader
 
-# ---------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
 
 # Characters the model will learn to classify
 CHARACTERS = (
@@ -42,12 +25,10 @@ CHAR_TO_IDX = {ch: i for i, ch in enumerate(CHARACTERS)}
 IDX_TO_CHAR = {i: ch for i, ch in enumerate(CHARACTERS)}
 
 IMAGE_SIZE = 64   # pixels (square, grayscale)
-FONT_PT    = 48   # point size used when rendering
+FONT_PT = 48   # point size used when rendering
 
 
-# ---------------------------------------------------------------------------
 # CharPredictor
-# ---------------------------------------------------------------------------
 
 class CharPredictor:
     def __init__(
@@ -76,18 +57,14 @@ class CharPredictor:
         self._X: np.ndarray | None = None
         self._y: np.ndarray | None = None
 
-    # ------------------------------------------------------------------
-    # 1. Font acquisition
-    # ------------------------------------------------------------------
+    # Font acquisition
 
     def download_fonts(self, api_key: str, count: int = 100) -> None:
         """Download `count` Google Fonts into self.fonts_dir."""
         downloader = FontDownloader(api_key=api_key)
         downloader.download(output_dir=self.fonts_dir, count=count)
 
-    # ------------------------------------------------------------------
-    # 2. Dataset construction
-    # ------------------------------------------------------------------
+    # Dataset construction
 
     def _collect_font_files(self) -> list[str]:
         """Return all .ttf / .otf paths found under self.fonts_dir."""
@@ -169,9 +146,7 @@ class CharPredictor:
         print(f"Dataset ready: {X.shape[0]} samples, {n_classes} classes.")
         return X, y
 
-    # ------------------------------------------------------------------
-    # 3. Model definition
-    # ------------------------------------------------------------------
+    # Model definition
 
     def build_model(self) -> "tf.keras.Model":
         """
@@ -227,9 +202,7 @@ class CharPredictor:
         self.model = model
         return model
 
-    # ------------------------------------------------------------------
-    # 4. Training
-    # ------------------------------------------------------------------
+    # Training
 
     def train(
         self,
@@ -291,9 +264,7 @@ class CharPredictor:
 
         return history
 
-    # ------------------------------------------------------------------
-    # 5. Inference
-    # ------------------------------------------------------------------
+    # Inference
 
     def load_model(self) -> None:
         """Load the saved model from self.model_dir."""
@@ -342,9 +313,7 @@ class CharPredictor:
             return IDX_TO_CHAR[int(np.argmax(probs))]
 
 
-# ---------------------------------------------------------------------------
 # Quick-start entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
